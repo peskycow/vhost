@@ -1,4 +1,5 @@
 // Copyright (C) 2019 Alibaba Cloud Computing. All rights reserved.
+// Modifications Copyright 2026 Aspect Build Systems, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs::File;
@@ -339,6 +340,38 @@ pub struct BackendReqHandler<S: VhostUserBackendReqHandler> {
     reply_ack_enabled: bool,
     // whether the endpoint has encountered any failure
     error: Option<i32>,
+    #[cfg(all(feature = "incremental", target_os = "linux"))]
+    incremental: IncrementalReceive,
+    #[cfg(all(feature = "incremental", target_os = "linux"))]
+    incremental_advertised_protocol_features: Option<u64>,
+}
+
+/// Result of one nonblocking incremental I/O step. The caller must wait for
+/// readability or writability after `WouldBlock`; this API never spins.
+#[cfg(all(feature = "incremental", target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncrementalProgress {
+    /// Bytes were read but the frame is incomplete.
+    Read,
+    /// Reply bytes were written.
+    Write,
+    /// One complete validated request was dispatched.
+    Request,
+    /// Wait for the socket to become readable.
+    WouldBlockRead,
+    /// Wait for the socket to become writable.
+    WouldBlockWrite,
+}
+
+#[cfg(all(feature = "incremental", target_os = "linux"))]
+#[derive(Default)]
+struct IncrementalReceive {
+    header: [u8; 12],
+    header_len: usize,
+    body: Vec<u8>,
+    body_len: usize,
+    files: Vec<File>,
+    rights_seen: bool,
 }
 
 impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
@@ -355,7 +388,154 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
             acked_protocol_features: 0,
             reply_ack_enabled: false,
             error: None,
+            #[cfg(all(feature = "incremental", target_os = "linux"))]
+            incremental: IncrementalReceive::default(),
+            #[cfg(all(feature = "incremental", target_os = "linux"))]
+            incremental_advertised_protocol_features: None,
         }
+    }
+
+    /// Make one nonblocking I/O step. Call only with a nonblocking socket and
+    /// abandon the connection after any error; dropping it closes retained FDs.
+    /// One frame and one reply are retained at most. Received descriptors are
+    /// CLOEXEC atomically and ancillary truncation is a fatal protocol error.
+    #[cfg(all(feature = "incremental", target_os = "linux"))]
+    pub fn incremental_step(&mut self) -> Result<IncrementalProgress> {
+        let result = self.incremental_step_inner();
+        if result.is_err() {
+            self.incremental = IncrementalReceive::default();
+            self.main_sock.queued = None;
+            self.error = Some(libc::EPROTO);
+        }
+        result
+    }
+
+    #[cfg(all(feature = "incremental", target_os = "linux"))]
+    fn incremental_step_inner(&mut self) -> Result<IncrementalProgress> {
+        use rustix::net::{
+            recvmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
+        };
+        use std::io::IoSliceMut;
+        use std::mem::MaybeUninit;
+        use vm_memory::ByteValued;
+
+        self.check_state()?;
+        self.main_sock
+            .socket()
+            .set_nonblocking(true)
+            .map_err(Error::SocketError)?;
+        self.main_sock.capture = true;
+        if let Some((bytes, files, sent)) = self.main_sock.queued.take() {
+            let fds: Vec<_> = if sent == 0 {
+                files.iter().map(AsRawFd::as_raw_fd).collect()
+            } else {
+                Vec::new()
+            };
+            // Bound work per wake and preserve descriptor transfer semantics on
+            // partial writes: rights accompany only the first successful byte.
+            let end = bytes.len().min(sent + 1024);
+            match self.main_sock.send_iovec(&[&bytes[sent..end]], Some(&fds)) {
+                Ok(0) => return Err(Error::Disconnected),
+                Ok(n) if sent + n == bytes.len() => return Ok(IncrementalProgress::Write),
+                Ok(n) => {
+                    self.main_sock.queued = Some((bytes, files, sent + n));
+                    return Ok(IncrementalProgress::Write);
+                }
+                Err(Error::SocketRetry(_)) => {
+                    self.main_sock.queued = Some((bytes, files, sent));
+                    return Ok(IncrementalProgress::WouldBlockWrite);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let state = &mut self.incremental;
+        let reading_header = state.header_len < 12;
+        let target = if reading_header {
+            &mut state.header[state.header_len..]
+        } else {
+            &mut state.body[state.body_len..]
+        };
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(32))];
+        let mut control = RecvAncillaryBuffer::new(&mut space);
+        let msg = match recvmsg(
+            self.main_sock.socket(),
+            &mut [IoSliceMut::new(target)],
+            &mut control,
+            RecvFlags::CMSG_CLOEXEC | RecvFlags::DONTWAIT,
+        ) {
+            Ok(msg) => msg,
+            Err(rustix::io::Errno::AGAIN) => return Ok(IncrementalProgress::WouldBlockRead),
+            Err(e) => {
+                return Err(Error::SocketError(std::io::Error::from_raw_os_error(
+                    e.raw_os_error(),
+                )))
+            }
+        };
+        if msg.bytes == 0 {
+            return Err(Error::Disconnected);
+        }
+        if msg.flags.contains(ReturnFlags::CTRUNC) {
+            return Err(Error::IncorrectFds);
+        }
+        for item in control.drain() {
+            match item {
+                RecvAncillaryMessage::ScmRights(rights) if reading_header && !state.rights_seen => {
+                    state.rights_seen = true;
+                    state.files.extend(rights.map(File::from));
+                }
+                _ => return Err(Error::IncorrectFds),
+            }
+        }
+        if reading_header {
+            state.header_len += msg.bytes;
+            if state.header_len == 12 {
+                let hdr = VhostUserMsgHeader::<FrontendReq>::read_exact_from(&state.header[..])
+                    .map_err(Error::SocketError)?;
+                if !hdr.is_valid() || hdr.is_reply() {
+                    return Err(Error::InvalidMessage);
+                }
+                state.body.resize(hdr.get_size() as usize, 0);
+            }
+        } else {
+            state.body_len += msg.bytes;
+        }
+        if state.header_len == 12 && state.body_len == state.body.len() {
+            let state = std::mem::take(&mut self.incremental);
+            let hdr = VhostUserMsgHeader::<FrontendReq>::read_exact_from(&state.header[..])
+                .map_err(Error::SocketError)?;
+            // Only the control operations required by the read-only virtio-fs
+            // device are accepted in this incremental mode. Optional migration,
+            // shared-object, hotplug and backend-request channels stay disabled.
+            match hdr.get_code()? {
+                FrontendReq::GET_FEATURES
+                | FrontendReq::SET_FEATURES
+                | FrontendReq::SET_OWNER
+                | FrontendReq::RESET_OWNER
+                | FrontendReq::SET_MEM_TABLE
+                | FrontendReq::SET_VRING_NUM
+                | FrontendReq::SET_VRING_ADDR
+                | FrontendReq::SET_VRING_BASE
+                | FrontendReq::GET_VRING_BASE
+                | FrontendReq::SET_VRING_KICK
+                | FrontendReq::SET_VRING_CALL
+                | FrontendReq::SET_VRING_ERR
+                | FrontendReq::GET_PROTOCOL_FEATURES
+                | FrontendReq::SET_PROTOCOL_FEATURES
+                | FrontendReq::GET_QUEUE_NUM
+                | FrontendReq::SET_VRING_ENABLE
+                | FrontendReq::GET_CONFIG
+                | FrontendReq::SET_CONFIG => {}
+                _ => return Err(Error::InvalidMessage),
+            }
+            let files = if state.files.is_empty() {
+                None
+            } else {
+                Some(state.files)
+            };
+            self.dispatch_owned(hdr, state.body, files)?;
+            return Ok(IncrementalProgress::Request);
+        }
+        Ok(IncrementalProgress::Read)
     }
 
     fn check_feature(&self, feat: VhostUserVirtioFeatures) -> Result<()> {
@@ -403,6 +583,10 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
     /// - decide what to do when error happens
     /// - optional recover from failure
     pub fn handle_request(&mut self) -> Result<()> {
+        #[cfg(all(feature = "incremental", target_os = "linux"))]
+        if self.main_sock.capture {
+            return Err(Error::InvalidOperation("incremental mode is active"));
+        }
         // Return error if the endpoint is already in failed state.
         self.check_state()?;
 
@@ -418,7 +602,7 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
         let (hdr, files) = self.main_sock.recv_header()?;
         self.check_attached_files(&hdr, &files)?;
 
-        let (size, buf) = match hdr.get_size() {
+        let (_size, buf) = match hdr.get_size() {
             0 => (0, vec![0u8; 0]),
             len => {
                 let (size2, rbuf) = self.main_sock.recv_data(len as usize)?;
@@ -429,6 +613,20 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
             }
         };
 
+        self.dispatch_owned(hdr, buf, files)
+    }
+
+    // Shared by the original blocking entry point and the bounded incremental
+    // entry point. All protocol/feature checks stay in this dispatcher.
+    fn dispatch_owned(
+        &mut self,
+        hdr: VhostUserMsgHeader<FrontendReq>,
+        buf: Vec<u8>,
+        files: Option<Vec<File>>,
+    ) -> Result<()> {
+        self.check_state()?;
+        self.check_attached_files(&hdr, &files)?;
+        let size = buf.len();
         match hdr.get_code() {
             Ok(FrontendReq::SET_OWNER) => {
                 self.check_request_size(&hdr, size, 0)?;
@@ -524,12 +722,36 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
                 #[cfg(feature = "xen")]
                 let features = features | VhostUserProtocolFeatures::XEN_MMAP;
 
+                // Incremental mode supports only the operations in its
+                // allowlist. In particular, never advertise memory hotplug,
+                // SHMEM, migration or backend-request channels here.
+                #[cfg(all(feature = "incremental", target_os = "linux"))]
+                let features = if self.main_sock.capture {
+                    let supported = VhostUserProtocolFeatures::MQ
+                        | VhostUserProtocolFeatures::CONFIG
+                        | VhostUserProtocolFeatures::REPLY_ACK;
+                    let features = features & supported;
+                    self.incremental_advertised_protocol_features = Some(features.bits());
+                    features
+                } else {
+                    features
+                };
+
                 let msg = VhostUserU64::new(features.bits());
                 self.send_reply_message(&hdr, &msg)?;
                 self.update_reply_ack_flag();
             }
             Ok(FrontendReq::SET_PROTOCOL_FEATURES) => {
                 let msg = self.extract_request_body::<VhostUserU64>(&hdr, size, &buf)?;
+                #[cfg(all(feature = "incremental", target_os = "linux"))]
+                if self.main_sock.capture {
+                    let advertised = self
+                        .incremental_advertised_protocol_features
+                        .ok_or(Error::InvalidOperation("protocol features not advertised"))?;
+                    if msg.value & !advertised != 0 {
+                        return Err(Error::InvalidMessage);
+                    }
+                }
                 let res = self.backend.set_protocol_features(msg.value);
                 self.acked_protocol_features = msg.value;
                 self.update_reply_ack_flag();
@@ -1036,6 +1258,406 @@ mod tests {
 
     use super::*;
     use crate::vhost_user::dummy_backend::DummyBackendReqHandler;
+
+    #[cfg(all(feature = "incremental", target_os = "linux"))]
+    #[test]
+    fn incremental_protocol_features_match_supported_operations() {
+        use std::io::{Read, Write};
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let backend = Arc::new(Mutex::new(DummyBackendReqHandler::new()));
+        let mut handler = BackendReqHandler::from_stream(server, backend.clone());
+        let owner = VhostUserMsgHeader::new(FrontendReq::SET_OWNER, 0, 0);
+        client.write_all(owner.as_slice()).unwrap();
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Request
+        );
+        let get_virtio = VhostUserMsgHeader::new(FrontendReq::GET_FEATURES, 0, 0);
+        client.write_all(get_virtio.as_slice()).unwrap();
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Request
+        );
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Write
+        );
+        let mut reply = [0u8; 20];
+        client.read_exact(&mut reply).unwrap();
+        let set_virtio = VhostUserMsgHeader::new(FrontendReq::SET_FEATURES, 0, 8);
+        client.write_all(set_virtio.as_slice()).unwrap();
+        client
+            .write_all(&u64::from_ne_bytes(reply[12..20].try_into().unwrap()).to_ne_bytes())
+            .unwrap();
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Read
+        );
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Request
+        );
+        let get = VhostUserMsgHeader::new(FrontendReq::GET_PROTOCOL_FEATURES, 0, 0);
+        client.write_all(get.as_slice()).unwrap();
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Request
+        );
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Write
+        );
+        client.read_exact(&mut reply).unwrap();
+        let actual = u64::from_ne_bytes(reply[12..20].try_into().unwrap());
+        let supported = (VhostUserProtocolFeatures::MQ
+            | VhostUserProtocolFeatures::CONFIG
+            | VhostUserProtocolFeatures::REPLY_ACK)
+            .bits();
+        assert_eq!(actual, supported);
+        let set = VhostUserMsgHeader::new(FrontendReq::SET_PROTOCOL_FEATURES, 0, 8);
+        client.write_all(set.as_slice()).unwrap();
+        client.write_all(&supported.to_ne_bytes()).unwrap();
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Read
+        );
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Request
+        );
+        assert_eq!(backend.lock().unwrap().acked_protocol_features, supported);
+        let queue = VhostUserMsgHeader::new(FrontendReq::GET_QUEUE_NUM, 0, 0);
+        client.write_all(queue.as_slice()).unwrap();
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Request
+        );
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Write
+        );
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(u64::from_ne_bytes(reply[12..20].try_into().unwrap()), 2);
+        let config = VhostUserConfig::new(0x100, 4, VhostUserConfigFlags::empty());
+        let get_config = VhostUserMsgHeader::new(FrontendReq::GET_CONFIG, 0, 16);
+        client.write_all(get_config.as_slice()).unwrap();
+        client.write_all(config.as_slice()).unwrap();
+        client.write_all(&[0; 4]).unwrap();
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Read
+        );
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Request
+        );
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Write
+        );
+        let mut config_reply = [0u8; 28];
+        client.read_exact(&mut config_reply).unwrap();
+        assert_eq!(&config_reply[24..], &[0xa5; 4]);
+        let mut set_config = VhostUserMsgHeader::new(FrontendReq::SET_CONFIG, 0, 16);
+        set_config.set_need_reply(true);
+        client.write_all(set_config.as_slice()).unwrap();
+        client.write_all(config.as_slice()).unwrap();
+        client.write_all(&[0xa5; 4]).unwrap();
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Read
+        );
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Request
+        );
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Write
+        );
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(u64::from_ne_bytes(reply[12..20].try_into().unwrap()), 0);
+        let set_bad = VhostUserMsgHeader::new(FrontendReq::SET_PROTOCOL_FEATURES, 0, 8);
+        client.write_all(set_bad.as_slice()).unwrap();
+        client
+            .write_all(&(supported | VhostUserProtocolFeatures::SHMEM.bits()).to_ne_bytes())
+            .unwrap();
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Read
+        );
+        assert!(handler.incremental_step().is_err());
+        assert_eq!(backend.lock().unwrap().acked_protocol_features, supported);
+
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let backend = Arc::new(Mutex::new(DummyBackendReqHandler::new()));
+        let mut handler = BackendReqHandler::from_stream(server, backend.clone());
+        client.write_all(get.as_slice()).unwrap();
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Request
+        );
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Write
+        );
+        client.read_exact(&mut reply).unwrap();
+        let unsupported = VhostUserMsgHeader::new(FrontendReq::GET_SHMEM_CONFIG, 0, 0);
+        client.write_all(unsupported.as_slice()).unwrap();
+        assert!(handler.incremental_step().is_err());
+        assert_eq!(backend.lock().unwrap().acked_protocol_features, 0);
+    }
+
+    #[cfg(all(feature = "incremental", target_os = "linux"))]
+    #[test]
+    fn blocking_protocol_features_remain_unchanged() {
+        use std::io::{Read, Write};
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let backend = Arc::new(Mutex::new(DummyBackendReqHandler::new()));
+        let mut handler = BackendReqHandler::from_stream(server, backend.clone());
+        let get = VhostUserMsgHeader::new(FrontendReq::GET_PROTOCOL_FEATURES, 0, 0);
+        client.write_all(get.as_slice()).unwrap();
+        handler.handle_request().unwrap();
+        let mut reply = [0u8; 20];
+        client.read_exact(&mut reply).unwrap();
+        let advertised = u64::from_ne_bytes(reply[12..20].try_into().unwrap());
+        assert_ne!(advertised & VhostUserProtocolFeatures::SHMEM.bits(), 0);
+        let set = VhostUserMsgHeader::new(FrontendReq::SET_PROTOCOL_FEATURES, 0, 8);
+        client.write_all(set.as_slice()).unwrap();
+        client
+            .write_all(&VhostUserProtocolFeatures::SHMEM.bits().to_ne_bytes())
+            .unwrap();
+        handler.handle_request().unwrap();
+        assert_eq!(
+            backend.lock().unwrap().acked_protocol_features,
+            VhostUserProtocolFeatures::SHMEM.bits()
+        );
+    }
+
+    #[cfg(all(feature = "incremental", target_os = "linux"))]
+    #[test]
+    fn incremental_partial_header_and_reply() {
+        use std::io::{Read, Write};
+        use vm_memory::ByteValued;
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let backend = Arc::new(Mutex::new(DummyBackendReqHandler::new()));
+        let mut handler = BackendReqHandler::from_stream(server, backend);
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::WouldBlockRead
+        );
+        let hdr = VhostUserMsgHeader::new(FrontendReq::GET_FEATURES, 0, 0);
+        client.write_all(&hdr.as_slice()[..3]).unwrap();
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Read
+        );
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::WouldBlockRead
+        );
+        client.write_all(&hdr.as_slice()[3..]).unwrap();
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Request
+        );
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Write
+        );
+        let mut reply = [0u8; 20];
+        client.read_exact(&mut reply).unwrap();
+        let rh = VhostUserMsgHeader::<FrontendReq>::read_exact_from(&reply[..12]).unwrap();
+        assert!(rh.is_reply());
+        assert_eq!(rh.get_size(), 8);
+        assert!(handler.handle_request().is_err());
+    }
+
+    #[cfg(all(feature = "incremental", target_os = "linux"))]
+    #[test]
+    fn incremental_split_body_and_invalid_frame() {
+        use std::io::Write;
+        use vm_memory::ByteValued;
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let backend = Arc::new(Mutex::new(DummyBackendReqHandler::new()));
+        let mut handler = BackendReqHandler::from_stream(server, backend);
+        let owner = VhostUserMsgHeader::new(FrontendReq::SET_OWNER, 0, 0);
+        client.write_all(owner.as_slice()).unwrap();
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Request
+        );
+        let hdr = VhostUserMsgHeader::new(FrontendReq::SET_FEATURES, 0, 8);
+        client.write_all(hdr.as_slice()).unwrap();
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Read
+        );
+        client.write_all(&[0, 0, 0]).unwrap();
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Read
+        );
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::WouldBlockRead
+        );
+        client.write_all(&[0; 5]).unwrap();
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Request
+        );
+        let hdr = VhostUserMsgHeader::new(FrontendReq::GET_FEATURES, 0, (MAX_MSG_SIZE + 1) as u32);
+        client.write_all(hdr.as_slice()).unwrap();
+        assert!(handler.incremental_step().is_err());
+        assert!(handler.incremental_step().is_err());
+    }
+
+    #[cfg(all(feature = "incremental", target_os = "linux"))]
+    #[test]
+    fn incremental_rights_cloexec_truncation_and_drop() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let backend = Arc::new(Mutex::new(DummyBackendReqHandler::new()));
+        let mut handler = BackendReqHandler::from_stream(server, backend);
+        let file = File::open("/dev/null").unwrap();
+        client
+            .send_with_fds(&[&[1u8][..]], &[file.as_raw_fd()])
+            .unwrap();
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Read
+        );
+        let retained = handler.incremental.files[0].as_raw_fd();
+        // SAFETY: retained is an open descriptor owned by handler.
+        assert_ne!(
+            unsafe { libc::fcntl(retained, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        client.write_all(&[0; 11]).unwrap();
+        assert!(handler.incremental_step().is_err());
+        assert!(handler.incremental.files.is_empty());
+        // SAFETY: F_GETFD safely reports EBADF after the descriptor is closed.
+        assert_eq!(unsafe { libc::fcntl(retained, libc::F_GETFD) }, -1);
+        let (server, client) = UnixStream::pair().unwrap();
+        let backend = Arc::new(Mutex::new(DummyBackendReqHandler::new()));
+        let mut handler = BackendReqHandler::from_stream(server, backend);
+        client
+            .send_with_fds(&[&[1u8][..]], &[file.as_raw_fd()])
+            .unwrap();
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Read
+        );
+        client
+            .send_with_fds(&[&[0u8][..]], &[file.as_raw_fd()])
+            .unwrap();
+        assert!(handler.incremental_step().is_err());
+        assert!(handler.incremental.files.is_empty());
+        let (server, client) = UnixStream::pair().unwrap();
+        let backend = Arc::new(Mutex::new(DummyBackendReqHandler::new()));
+        let mut handler = BackendReqHandler::from_stream(server, backend);
+        client
+            .send_with_fds(&[&[1u8][..]], &vec![file.as_raw_fd(); 40])
+            .unwrap();
+        assert!(handler.incremental_step().is_err());
+        assert!(handler.incremental.files.is_empty());
+    }
+
+    #[cfg(all(feature = "incremental", target_os = "linux"))]
+    #[test]
+    fn incremental_partial_reply_sends_rights_once() {
+        use std::os::fd::AsRawFd;
+        use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+        let (server, client) = UnixStream::pair().unwrap();
+        let backend = Arc::new(Mutex::new(DummyBackendReqHandler::new()));
+        let mut handler = BackendReqHandler::from_stream(server, backend);
+        handler.main_sock.queued = Some((vec![7; 2048], vec![File::open("/dev/null").unwrap()], 0));
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Write
+        );
+        assert_eq!(handler.main_sock.queued.as_ref().unwrap().2, 1024);
+        let mut data = [0u8; 1024];
+        let mut iov = [libc::iovec {
+            iov_base: data.as_mut_ptr().cast(),
+            iov_len: data.len(),
+        }];
+        let mut fds = [-1; 4];
+        // SAFETY: buffers are writable and live for the call; received FDs are closed below.
+        let (n, count) = unsafe { client.recv_with_fds(&mut iov, &mut fds).unwrap() };
+        assert_eq!((n, count), (1024, 1));
+        // SAFETY: recv_with_fds transferred ownership of this descriptor.
+        unsafe {
+            libc::close(fds[0]);
+        }
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Write
+        );
+        let (n, count) = unsafe { client.recv_with_fds(&mut iov, &mut fds).unwrap() };
+        assert_eq!((n, count), (1024, 0));
+        assert!(handler.main_sock.queued.is_none());
+        assert!(client.as_raw_fd() >= 0);
+    }
+
+    #[cfg(all(feature = "incremental", target_os = "linux"))]
+    #[test]
+    fn incremental_eof_cancels_partial_frame() {
+        use std::io::Write;
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let backend = Arc::new(Mutex::new(DummyBackendReqHandler::new()));
+        let mut handler = BackendReqHandler::from_stream(server, backend);
+        client.write_all(&[1, 2]).unwrap();
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Read
+        );
+        drop(client);
+        assert!(matches!(
+            handler.incremental_step(),
+            Err(Error::Disconnected)
+        ));
+        assert_eq!(handler.incremental.header_len, 0);
+    }
+
+    #[cfg(all(feature = "incremental", target_os = "linux"))]
+    #[test]
+    fn incremental_blocked_reply_is_retained_without_spin() {
+        use std::io::Write;
+        let (server, mut client) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let mut fill = &server;
+        let block = [0; 4096];
+        loop {
+            match fill.write(&block) {
+                Ok(0) => panic!("unexpected EOF"),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let backend = Arc::new(Mutex::new(DummyBackendReqHandler::new()));
+        let mut handler = BackendReqHandler::from_stream(server, backend);
+        handler.main_sock.queued = Some((vec![7; 1024], Vec::new(), 0));
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::WouldBlockWrite
+        );
+        assert_eq!(handler.main_sock.queued.as_ref().unwrap().2, 0);
+        use std::io::Read;
+        client.set_nonblocking(true).unwrap();
+        let mut buf = [0; 8192];
+        while client.read(&mut buf).is_ok() {}
+        assert_eq!(
+            handler.incremental_step().unwrap(),
+            IncrementalProgress::Write
+        );
+        assert!(handler.main_sock.queued.is_none());
+    }
+
 
     #[test]
     fn test_backend_req_handler_new() {

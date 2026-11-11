@@ -1,4 +1,5 @@
 // Copyright (C) 2019 Alibaba Cloud Computing. All rights reserved.
+// Modifications Copyright 2026 Aspect Build Systems, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 //! Structs for Unix Domain Socket listener and endpoint.
@@ -108,6 +109,10 @@ impl Drop for Listener {
 pub(super) struct Endpoint<H: MsgHeader> {
     sock: UnixStream,
     _h: PhantomData<H>,
+    #[cfg(feature = "incremental")]
+    pub(super) queued: Option<(Vec<u8>, Vec<File>, usize)>,
+    #[cfg(feature = "incremental")]
+    pub(super) capture: bool,
 }
 
 impl<H: MsgHeader> Endpoint<H> {
@@ -126,7 +131,16 @@ impl<H: MsgHeader> Endpoint<H> {
         Endpoint {
             sock,
             _h: PhantomData,
+            #[cfg(feature = "incremental")]
+            queued: None,
+            #[cfg(feature = "incremental")]
+            capture: false,
         }
+    }
+
+    #[cfg(all(feature = "incremental", target_os = "linux"))]
+    pub(super) fn socket(&self) -> &UnixStream {
+        &self.sock
     }
 
     /// Sends bytes from scatter-gather vectors over the socket with optional attached file
@@ -150,6 +164,34 @@ impl<H: MsgHeader> Endpoint<H> {
     /// * - SocketBroken: the underline socket is broken.
     /// * - SocketError: other socket related errors.
     pub fn send_iovec_all(&mut self, iovs: &[&[u8]], fds: Option<&[RawFd]>) -> Result<usize> {
+        #[cfg(feature = "incremental")]
+        if self.capture {
+            use std::os::fd::BorrowedFd;
+            if self.queued.is_some() {
+                return Err(Error::InvalidOperation("reply still pending"));
+            }
+            let mut bytes = Vec::new();
+            for slice in iovs {
+                let next = bytes
+                    .len()
+                    .checked_add(slice.len())
+                    .ok_or(Error::InvalidMessage)?;
+                if next > H::MAX_MSG_SIZE + 12 {
+                    return Err(Error::InvalidMessage);
+                }
+                bytes.extend_from_slice(slice);
+            }
+            let mut owned = Vec::new();
+            for &fd in fds.unwrap_or_default() {
+                // SAFETY: the caller keeps each descriptor alive for this call.
+                let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+                let duplicate = borrowed.try_clone_to_owned().map_err(Error::SocketError)?;
+                owned.push(File::from(duplicate));
+            }
+            let len = bytes.len();
+            self.queued = Some((bytes, owned, 0));
+            return Ok(len);
+        }
         let mut data_sent = 0;
         let mut data_total = 0;
         let iov_lens: Vec<usize> = iovs.iter().map(|iov| iov.len()).collect();

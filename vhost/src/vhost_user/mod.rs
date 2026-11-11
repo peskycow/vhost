@@ -590,3 +590,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(feature = "incremental", target_os = "linux"))]
+pub use self::backend_req_handler::IncrementalProgress;
